@@ -23,6 +23,9 @@ STATE_DIR="$PREFIX/etc/ssguest"
 NODES_DIR="$STATE_DIR/nodes"
 HOST_FILE="$STATE_DIR/host"
 LIBSODIUM_BACKUP="$STATE_DIR/libsodium"
+SOCKS_CONF="$STATE_DIR/socks.conf"
+SOCKS_RUN="$PREFIX/usr/bin/ssguest-socks-run"
+SOCKS_SERVICE="$PREFIX/etc/init.d/ssguest-socks"
 INIT_DIR="$PREFIX/etc/init.d"
 SERVICE="$INIT_DIR/ssguest"
 SELF="$PREFIX/usr/bin/ssguest"
@@ -32,6 +35,17 @@ DEFAULT_METHOD=${SSG_METHOD:-chacha20-ietf-poly1305}
 PORT_START=${SSG_PORT_START:-8388}
 PORT_END=${SSG_PORT_END:-8487}
 FW_PREFIX=${SSG_FW_PREFIX:-Allow-Guest}
+SOCKS_FW_NAME=${SSG_SOCKS_FW_NAME:-Allow-GuestSocks}
+SOCKS_PORT_START=${SSG_SOCKS_PORT_START:-10808}
+SOCKS_PORT_END=${SSG_SOCKS_PORT_END:-10820}
+SOCKS_USER_DEFAULT=${SSG_SOCKS_USER:-guest}
+SOCKS_ENGINE_PREF=${SSG_SOCKS_ENGINE:-auto}
+GOST_VERSION=${SSG_GOST_VERSION:-3.3.3}
+GOST_BIN="$PREFIX/usr/bin/ssguest-gost"
+SOCKS_ENGINE=""
+SOCKS_BIN=""
+DL=""
+REGION=""
 SS_BIN=""
 HOST_CACHE=""
 
@@ -40,6 +54,260 @@ ok()   { printf '[ OK ] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*"; }
 err()  { printf '[FAIL] %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
+
+setup_downloader() {
+  if command -v curl >/dev/null 2>&1; then
+    DL=curl
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    DL=wget
+    return 0
+  fi
+  if command -v opkg >/dev/null 2>&1; then
+    opkg update >/dev/null 2>&1 || true
+    opkg install curl >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk update >/dev/null 2>&1 || true
+    apk add curl >/dev/null 2>&1 || true
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    DL=curl
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    DL=wget
+    return 0
+  fi
+  die "没有可用的下载工具(curl/wget),请先安装 curl"
+}
+
+http_get() {
+  local t="${2:-10}"
+  case "$DL" in
+    curl) curl -fsSL --connect-timeout 6 --max-time "$t" "$1" 2>/dev/null ;;
+    wget) wget -q -T "$t" -O - "$1" 2>/dev/null ;;
+  esac
+}
+
+http_download() {
+  case "$DL" in
+    curl) curl -fL --connect-timeout 8 --max-time 900 -o "$2" "$1" 2>/dev/null ;;
+    wget) wget -q -T 120 -O "$2" "$1" 2>/dev/null ;;
+  esac
+}
+
+probe_geo_country() {
+  local body code
+  body=$(http_get "https://api.ip.sb/geoip" 8)
+  code=$(printf '%s' "$body" | sed -n 's/.*"country_code"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' | head -n1)
+  [ -n "$code" ] && { printf '%s\n' "$code"; return 0; }
+  body=$(http_get "http://ip-api.com/json/?fields=countryCode" 8)
+  code=$(printf '%s' "$body" | sed -n 's/.*"countryCode"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' | head -n1)
+  [ -n "$code" ] && { printf '%s\n' "$code"; return 0; }
+  return 1
+}
+
+github_reachable() {
+  case "$DL" in
+    curl) curl -fsS -o /dev/null --connect-timeout 5 --max-time 8 https://github.com 2>/dev/null ;;
+    wget) wget -q -T 8 -O /dev/null https://github.com 2>/dev/null ;;
+  esac
+}
+
+detect_region() {
+  local country
+  country=$(probe_geo_country 2>/dev/null || true)
+  if [ -n "$country" ]; then
+    if [ "$country" = "CN" ]; then
+      REGION=domestic
+      msg "网络归属: 中国大陆,优先使用 GitHub 镜像"
+    else
+      REGION=foreign
+      msg "网络归属: $country,优先直连 GitHub"
+    fi
+    return 0
+  fi
+  if github_reachable; then
+    REGION=foreign
+    msg "GitHub 可直连,按国外网络处理"
+  else
+    REGION=domestic
+    msg "GitHub 直连失败,按国内网络处理,使用镜像"
+  fi
+}
+
+gh_base_list() {
+  if [ -n "${SSG_GH_MIRROR:-}" ]; then
+    printf '%s\n' "$SSG_GH_MIRROR"
+    return 0
+  fi
+  if [ "$REGION" = "domestic" ]; then
+    printf '%s\n' "https://gh-proxy.com https://ghfast.top https://ghproxy.net https://gh.llkk.cc https://mirror.ghproxy.com https://github.com"
+  else
+    printf '%s\n' "https://github.com https://gh-proxy.com https://ghfast.top https://ghproxy.net https://gh.llkk.cc"
+  fi
+}
+
+gh_url() {
+  case "$1" in
+    https://github.com) printf '%s/%s' "$1" "$2" ;;
+    *) printf '%s/https://github.com/%s' "${1%/}" "$2" ;;
+  esac
+}
+
+detect_gost_arch() {
+  local mach
+  if [ -n "${SSG_GOST_ARCH:-}" ]; then
+    GOST_ARCH="$SSG_GOST_ARCH"
+    return 0
+  fi
+  mach=$(uname -m 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  case "$mach" in
+    x86_64|amd64)                 GOST_ARCH=linux_amd64 ;;
+    i386|i486|i586|i686|x86)      GOST_ARCH=linux_386 ;;
+    aarch64|arm64)                GOST_ARCH=linux_arm64 ;;
+    armv7l|armv7)                 GOST_ARCH=linux_armv7 ;;
+    armv6l|armv6)                 GOST_ARCH=linux_armv6 ;;
+    armv5tel|armv5tejl|armv5)     GOST_ARCH=linux_armv5 ;;
+    mips64el|mips64le)            GOST_ARCH=linux_mips64le_hardfloat ;;
+    mips64)                       GOST_ARCH=linux_mips64_hardfloat ;;
+    mipsel|mipsle)                GOST_ARCH=linux_mipsle_softfloat ;;
+    mips)                         GOST_ARCH=linux_mips_softfloat ;;
+    loongarch64|loong64)          GOST_ARCH=linux_loong64 ;;
+    riscv64)                      GOST_ARCH=linux_riscv64 ;;
+    s390x)                        GOST_ARCH=linux_s390x ;;
+    *) die "无法识别架构: $mach,可设置 SSG_GOST_ARCH=linux_armv7 手动指定" ;;
+  esac
+}
+
+gost_ok() {
+  [ -n "${1:-}" ] && [ -x "$1" ] && "$1" -V 2>&1 | grep -qi 'gost'
+}
+
+ensure_gost() {
+  local base url tmp bin
+  GOST_VERSION=${GOST_VERSION#v}
+  if gost_ok "$GOST_BIN"; then
+    SOCKS_BIN="$GOST_BIN"
+    return 0
+  fi
+  if command -v gost >/dev/null 2>&1 && gost_ok "$(command -v gost)"; then
+    GOST_BIN=$(command -v gost)
+    SOCKS_BIN="$GOST_BIN"
+    return 0
+  fi
+
+  setup_downloader
+  detect_gost_arch
+  detect_region
+  msg "目标架构: $(uname -m 2>/dev/null) -> $GOST_ARCH"
+
+  TMP_DIR="/tmp/ssguest-gost.$$"
+  rm -rf "$TMP_DIR"
+  mkdir -p "$TMP_DIR" || die "无法创建临时目录"
+  for base in $(gh_base_list); do
+    url=$(gh_url "$base" "go-gost/gost/releases/download/v$GOST_VERSION/gost_${GOST_VERSION}_${GOST_ARCH}.tar.gz")
+    msg "下载: $url"
+    if http_download "$url" "$TMP_DIR/gost.tar.gz"; then
+      if tar -xzf "$TMP_DIR/gost.tar.gz" -C "$TMP_DIR" 2>/dev/null ||
+         gzip -dc "$TMP_DIR/gost.tar.gz" 2>/dev/null | tar -xf - -C "$TMP_DIR" 2>/dev/null; then
+        bin=$(find "$TMP_DIR" -type f -name gost 2>/dev/null | head -n1)
+        if [ -n "$bin" ]; then
+          chmod 755 "$bin" 2>/dev/null || true
+          if gost_ok "$bin"; then
+            mkdir -p "${GOST_BIN%/*}" || die "无法创建 $(dirname "$GOST_BIN")"
+            cp "$bin" "$GOST_BIN" || {
+              rm -f "$GOST_BIN"
+              rm -rf "$TMP_DIR"
+              TMP_DIR=""
+              die "无法写入 $GOST_BIN(可能是存储空间不足)"
+            }
+            chmod 755 "$GOST_BIN" 2>/dev/null || true
+            printf '%s\n' "$GOST_VERSION" > "$STATE_DIR/gost.version" 2>/dev/null || true
+            rm -rf "$TMP_DIR"
+            TMP_DIR=""
+            ok "gost 已安装: $GOST_BIN"
+            SOCKS_BIN="$GOST_BIN"
+            return 0
+          fi
+        fi
+      fi
+    fi
+    rm -f "$TMP_DIR/gost.tar.gz"
+  done
+  rm -rf "$TMP_DIR"
+  TMP_DIR=""
+  die "gost 下载失败,可设置 SSG_GH_MIRROR=https://ghfast.top 或 SSG_GOST_ARCH 后重试"
+}
+
+microsocks_ok() {
+  command -v microsocks >/dev/null 2>&1 &&
+    microsocks -h 2>&1 | grep -qi 'microsocks'
+}
+
+package_install_socks() {
+  local pkg=$1
+  if command -v opkg >/dev/null 2>&1; then
+    opkg update >/dev/null 2>&1 || true
+    opkg install "$pkg" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  if command -v apk >/dev/null 2>&1; then
+    apk update >/dev/null 2>&1 || true
+    apk add "$pkg" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  return 1
+}
+
+ensure_socks_engine() {
+  local pref="$SOCKS_ENGINE_PREF"
+  case "$pref" in
+    microsocks)
+      microsocks_ok || package_install_socks microsocks || die "无法安装 microsocks"
+      SOCKS_ENGINE=microsocks
+      SOCKS_BIN=$(command -v microsocks)
+      return 0
+      ;;
+    gost)
+      if command -v gost >/dev/null 2>&1 && gost_ok "$(command -v gost)"; then
+        SOCKS_ENGINE=gost
+        SOCKS_BIN=$(command -v gost)
+      else
+        ensure_gost
+        SOCKS_ENGINE=gost
+        SOCKS_BIN="$GOST_BIN"
+      fi
+      return 0
+      ;;
+  esac
+
+  # auto:优先用固件源里的轻量 microsocks,没有再拉 gost 静态包
+  if microsocks_ok; then
+    SOCKS_ENGINE=microsocks
+    SOCKS_BIN=$(command -v microsocks)
+    return 0
+  fi
+  if command -v gost >/dev/null 2>&1 && gost_ok "$(command -v gost)"; then
+    SOCKS_ENGINE=gost
+    SOCKS_BIN=$(command -v gost)
+    return 0
+  fi
+  if package_install_socks microsocks && microsocks_ok; then
+    SOCKS_ENGINE=microsocks
+    SOCKS_BIN=$(command -v microsocks)
+    return 0
+  fi
+  if package_install_socks gost && command -v gost >/dev/null 2>&1 && gost_ok "$(command -v gost)"; then
+    SOCKS_ENGINE=gost
+    SOCKS_BIN=$(command -v gost)
+    return 0
+  fi
+  ensure_gost
+  SOCKS_ENGINE=gost
+  SOCKS_BIN="$GOST_BIN"
+}
 
 need_root() {
   [ "$(id -u 2>/dev/null)" = "0" ] || die "请用 root 运行(OpenWrt 默认就是 root)"
@@ -252,9 +520,9 @@ port_in_use() {
   port_listening "$p"
 }
 
-find_free_port() {
-  local p=$PORT_START
-  while [ "$p" -le "$PORT_END" ]; do
+find_free_port_range() {
+  local p=$1
+  while [ "$p" -le "$2" ]; do
     if ! port_in_use "$p"; then
       printf '%s\n' "$p"
       return 0
@@ -262,6 +530,10 @@ find_free_port() {
     p=$((p + 1))
   done
   return 1
+}
+
+find_free_port() {
+  find_free_port_range "$PORT_START" "$PORT_END"
 }
 
 normalize_port() {
@@ -311,9 +583,8 @@ fw_reload() {
   fi
 }
 
-fw_add() {
-  local id=$1 port=$2 name sect
-  name="$FW_PREFIX$id"
+fw_add_rule() {
+  local name=$1 port=$2 proto=$3 sect
   command -v uci >/dev/null 2>&1 || {
     err "找不到 uci,无法添加防火墙规则"
     return 1
@@ -334,13 +605,17 @@ fw_add() {
   uci delete "firewall.$sect.src_ip" >/dev/null 2>&1 || true
   uci set "firewall.$sect.src=wan" || return 1
   uci set "firewall.$sect.family=any" || return 1
-  uci set "firewall.$sect.proto=tcp udp" || return 1
+  uci set "firewall.$sect.proto=$proto" || return 1
   uci set "firewall.$sect.dest_port=$port" || return 1
   uci set "firewall.$sect.target=ACCEPT" || return 1
   uci set "firewall.$sect.enabled=1" >/dev/null 2>&1 || true
   uci commit firewall || return 1
   fw_reload
-  ok "防火墙规则已写入: $name (WAN 入站 TCP/UDP $port)"
+  ok "防火墙规则已写入: $name (WAN 入站 $proto $port)"
+}
+
+fw_add() {
+  fw_add_rule "$FW_PREFIX$1" "$2" "tcp udp"
 }
 
 fw_del() {
@@ -441,6 +716,8 @@ show_node() {
 
 cmd_add() {
   local port="${1:-}" id method pass name host
+  ensure_ss
+  ensure_service
   if [ -z "$port" ]; then
     printf '端口(直接回车自动分配 %s-%s): ' "$PORT_START" "$PORT_END"
     IFS= read -r port || port=""
@@ -574,27 +851,274 @@ cmd_host() {
   ok "链接地址已固定为: $h"
 }
 
+socks_get() {
+  sed -n "s/^$1=//p" "$SOCKS_CONF" 2>/dev/null | head -n1
+}
+
+socks_state() {
+  if [ ! -f "$SOCKS_CONF" ]; then
+    printf '未配置'
+    return
+  fi
+  if [ ! -x "$SOCKS_SERVICE" ]; then
+    printf '已配置'
+    return
+  fi
+  if ! command -v procd >/dev/null 2>&1; then
+    printf '未加载'
+    return
+  fi
+  if "$SOCKS_SERVICE" status >/dev/null 2>&1; then
+    printf '运行中'
+  else
+    printf '未运行'
+  fi
+}
+
+socks_service_stop() {
+  [ -x "$SOCKS_SERVICE" ] || return 0
+  command -v procd >/dev/null 2>&1 || return 0
+  "$SOCKS_SERVICE" stop >/dev/null 2>&1 || true
+}
+
+socks_service_restart() {
+  [ -x "$SOCKS_SERVICE" ] || return 0
+  command -v procd >/dev/null 2>&1 || return 0
+  "$SOCKS_SERVICE" restart >/dev/null 2>&1 || "$SOCKS_SERVICE" start >/dev/null 2>&1 || {
+    warn "SOCKS5 服务启动失败,请执行 $SOCKS_SERVICE status 查看"
+    return 1
+  }
+}
+
+write_socks_conf() {
+  local port=$1 user=$2 pass=$3 engine=$4 bin=$5
+  (
+    umask 077
+    cat > "$SOCKS_CONF" <<EOF
+PORT=$port
+USER=$user
+PASS=$pass
+ENGINE=$engine
+BIN=$bin
+CREATED='$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)'
+EOF
+  )
+}
+
+ensure_socks_service() {
+  [ -f "$SOCKS_CONF" ] || return 0
+  local bin
+  bin=$(socks_get BIN)
+  [ -n "$bin" ] || return 1
+  cat > "$SOCKS_RUN" <<EOF
+#!/bin/sh
+. "$SOCKS_CONF" || exit 1
+case "\$ENGINE" in
+  gost) exec "\$BIN" -L "socks5://\$USER:\$PASS@:\$PORT" ;;
+  microsocks) exec "\$BIN" -i 0.0.0.0 -p "\$PORT" -u "\$USER" -P "\$PASS" ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod 755 "$SOCKS_RUN" || return 1
+  cat > "$SOCKS_SERVICE" <<EOF
+#!/bin/sh /etc/rc.common
+START=96
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command $SOCKS_RUN
+	procd_set_param respawn 3600 5 5
+	procd_set_param file "$SOCKS_CONF"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+EOF
+  chmod 755 "$SOCKS_SERVICE" || return 1
+  if command -v procd >/dev/null 2>&1; then
+    "$SOCKS_SERVICE" enable >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_socks_add() {
+  local port="${1:-}" old_port="" user pass answer
+  if [ -f "$SOCKS_CONF" ]; then
+    old_port=$(socks_get PORT)
+    printf '已有 SOCKS5(端口 %s),重建会更换密码,继续? [y/N]: ' "$old_port"
+    IFS= read -r answer || answer=""
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) msg "已取消"; return 0 ;;
+    esac
+  fi
+
+  ensure_socks_engine
+  [ -n "$SOCKS_BIN" ] || die "找不到可用的 SOCKS5 服务端"
+
+  if [ -f "$SOCKS_CONF" ]; then
+    socks_service_stop
+  fi
+
+  if [ -z "$port" ]; then
+    printf 'SOCKS5 端口(回车自动分配 %s-%s): ' "$SOCKS_PORT_START" "$SOCKS_PORT_END"
+    IFS= read -r port || port=""
+  fi
+  if [ -n "$port" ]; then
+    case "$port" in
+      *[!0-9]*) die "端口必须是数字" ;;
+    esac
+    port=$(normalize_port "$port")
+    { [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; } 2>/dev/null || die "端口范围是 1-65535"
+    if port_in_use "$port"; then
+      socks_service_restart || true
+      die "端口 $port 已被占用"
+    fi
+  else
+    port=$(find_free_port_range "$SOCKS_PORT_START" "$SOCKS_PORT_END") || {
+      socks_service_restart || true
+      die "SOCKS5 端口段 $SOCKS_PORT_START-$SOCKS_PORT_END 已用完"
+    }
+  fi
+
+  user="$SOCKS_USER_DEFAULT"
+  case "$user" in
+    ''|*[!A-Za-z0-9._-]*) die "SOCKS5 用户名无效: $user" ;;
+  esac
+  pass=$(gen_password) || die "生成 SOCKS5 密码失败"
+  [ -n "$pass" ] || die "生成 SOCKS5 密码失败"
+
+  write_socks_conf "$port" "$user" "$pass" "$SOCKS_ENGINE" "$SOCKS_BIN" || die "写入 SOCKS5 配置失败"
+  ensure_socks_service || {
+    rm -f "$SOCKS_CONF"
+    die "写入 SOCKS5 服务失败"
+  }
+  if ! fw_add_rule "$SOCKS_FW_NAME" "$port" "tcp"; then
+    socks_service_stop
+    rm -f "$SOCKS_CONF" "$SOCKS_RUN" "$SOCKS_SERVICE"
+    fw_del "$SOCKS_FW_NAME" >/dev/null 2>&1 || true
+    die "SOCKS5 未创建:防火墙规则写入失败"
+  fi
+  socks_service_restart || true
+
+  msg ""
+  ok "SOCKS5 已开启"
+  cmd_socks_show
+}
+
+cmd_socks_show() {
+  local port user pass engine host uri rule
+  if [ ! -f "$SOCKS_CONF" ]; then
+    msg "SOCKS5 还没有配置。"
+    return 0
+  fi
+  port=$(socks_get PORT)
+  user=$(socks_get USER)
+  pass=$(socks_get PASS)
+  engine=$(socks_get ENGINE)
+  host=$(get_host)
+  rule="$SOCKS_FW_NAME"
+  if command -v uci >/dev/null 2>&1 && [ -n "$(fw_find "$rule" | head -n1)" ]; then
+    rule="$rule (已放行)"
+  else
+    rule="$rule (未找到)"
+  fi
+  if [ "$host" = "<路由器公网IP>" ]; then
+    uri="未探测到公网 IP,请先执行: ssguest host 你的域名或IP"
+  else
+    case "$host" in
+      \[*\]) ;;
+      *:*) host="[$host]" ;;
+    esac
+    uri="socks5://$user:$pass@$host:$port"
+  fi
+  msg "----- SOCKS5 -----"
+  msg "  地址:   $host:$port"
+  msg "  用户名: $user"
+  msg "  密码:   $pass"
+  msg "  类型:   SOCKS5 (TCP)"
+  msg "  引擎:   $engine"
+  msg "  防火墙: $rule"
+  msg "  链接:   $uri"
+  if port_listening "$port"; then
+    msg "  状态:   运行中"
+  else
+    msg "  状态:   未监听(可执行 $SOCKS_SERVICE restart)"
+  fi
+}
+
+cmd_socks_del() {
+  local answer
+  if [ ! -f "$SOCKS_CONF" ]; then
+    msg "SOCKS5 还没有配置。"
+    return 0
+  fi
+  printf '确认关闭并删除 SOCKS5 ? [y/N]: '
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) msg "已取消"; return 0 ;;
+  esac
+  socks_service_stop
+  [ -x "$SOCKS_SERVICE" ] && "$SOCKS_SERVICE" disable >/dev/null 2>&1 || true
+  fw_del "$SOCKS_FW_NAME"
+  rm -f "$SOCKS_CONF" "$SOCKS_RUN" "$SOCKS_SERVICE"
+  ok "SOCKS5 已关闭并删除"
+}
+
+cmd_socks_menu() {
+  local choice port
+  while :; do
+    msg ""
+    msg "=============================================="
+    msg " OpenWrt SOCKS5 管理"
+    msg " 状态: $(socks_state)"
+    if [ -f "$SOCKS_CONF" ]; then
+      port=$(socks_get PORT)
+      msg " 端口: $port"
+    fi
+    msg "=============================================="
+    msg " 1) 开启/重建 SOCKS5"
+    msg " 2) 查看 SOCKS5"
+    msg " 3) 关闭并删除 SOCKS5"
+    msg " 4) 返回主菜单"
+    printf '请选择 [1-4]: '
+    IFS= read -r choice || break
+    case "$choice" in
+      1) cmd_socks_add ;;
+      2) cmd_socks_show ;;
+      3) cmd_socks_del ;;
+      4|q|Q) break ;;
+      *) warn "请输入 1-4" ;;
+    esac
+  done
+}
+
 menu() {
   local choice n
   while :; do
     n=$(node_count)
     msg ""
     msg "=============================================="
-    msg " OpenWrt Shadowsocks 节点管理"
-    msg " 节点: $n    服务: $(service_state)"
+    msg " OpenWrt Shadowsocks / SOCKS5"
+    msg " SS 节点: $n    SS 服务: $(service_state)"
+    msg " SOCKS5: $(socks_state)"
     msg "=============================================="
-    msg " 1) 添加节点"
-    msg " 2) 删除节点"
-    msg " 3) 查看已有节点"
-    msg " 4) 退出"
-    printf '请选择 [1-4]: '
+    msg " 1) 添加 Shadowsocks 节点"
+    msg " 2) 删除 Shadowsocks 节点"
+    msg " 3) 查看 Shadowsocks 节点"
+    msg " 4) SOCKS5 管理"
+    msg " 5) 退出"
+    printf '请选择 [1-5]: '
     IFS= read -r choice || break
     case "$choice" in
       1) cmd_add ;;
       2) cmd_del ;;
       3) cmd_list ;;
-      4|q|Q) break ;;
-      *) warn "请输入 1-4" ;;
+      4) cmd_socks_menu ;;
+      5|q|Q) break ;;
+      *) warn "请输入 1-5" ;;
     esac
   done
 }
@@ -605,10 +1129,14 @@ ssguest - OpenWrt Shadowsocks 节点管理
 
 用法:
   ssguest                 进入菜单
-  ssguest add [端口]      添加节点(端口可省略)
-  ssguest del [节点号]    删除节点
-  ssguest list            查看节点
+  ssguest add [端口]      添加 Shadowsocks 节点
+  ssguest del [节点号]    删除 Shadowsocks 节点
+  ssguest list            查看 Shadowsocks 节点
   ssguest host [地址]     设置链接使用的域名/IP
+  ssguest socks           打开 SOCKS5 管理菜单
+  ssguest socks-add [端口] 开启/重建 SOCKS5
+  ssguest socks-list      查看 SOCKS5
+  ssguest socks-del       关闭并删除 SOCKS5
   ssguest help            显示帮助
 
 环境变量:
@@ -617,6 +1145,14 @@ ssguest - OpenWrt Shadowsocks 节点管理
   SSG_PORT_END    自动分配端口终点,默认 8487
   SSG_FW_PREFIX   防火墙规则前缀,默认 Allow-Guest
   SSG_HOST        链接使用的域名/IP
+  SSG_SOCKS_PORT_START   SOCKS5 端口起点,默认 10808
+  SSG_SOCKS_PORT_END     SOCKS5 端口终点,默认 10820
+  SSG_SOCKS_USER         SOCKS5 用户名,默认 guest
+  SSG_SOCKS_FW_NAME      SOCKS5 防火墙规则名,默认 Allow-GuestSocks
+  SSG_SOCKS_ENGINE       auto/microsocks/gost,默认 auto
+  SSG_GOST_VERSION       gost 版本,默认 3.3.3
+  SSG_GOST_ARCH          手动指定 gost 架构资产
+  SSG_GH_MIRROR          GitHub 镜像,例如 https://ghfast.top
 EOF
 }
 
@@ -628,8 +1164,6 @@ main() {
   need_root
   is_openwrt || die "未检测到 OpenWrt(/etc/openwrt_release 或 /etc/rc.common 不存在)"
   ensure_dirs
-  ensure_ss
-  ensure_service
   self_install
 
   case "${1:-}" in
@@ -637,7 +1171,18 @@ main() {
     del|delete|remove) shift; cmd_del "${1:-}" ;;
     list|ls) cmd_list ;;
     host) shift; cmd_host "${1:-}" ;;
-    menu|'') menu ;;
+    socks) shift; cmd_socks_menu ;;
+    socks-add) shift; cmd_socks_add "${1:-}" ;;
+    socks-del|socks-remove) cmd_socks_del ;;
+    socks-list|socks-show) cmd_socks_show ;;
+    menu|'')
+      if command -v ss-server >/dev/null 2>&1; then
+        ensure_ss
+        ensure_service
+      fi
+      [ -f "$SOCKS_CONF" ] && ensure_socks_service
+      menu
+      ;;
     *) usage; exit 1 ;;
   esac
 }
