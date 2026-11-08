@@ -327,11 +327,17 @@ fw_add() {
     }
     uci set "firewall.$sect.name=$name" || return 1
   fi
+  # 路由器本机服务是 input 规则:不能保留 dest/dest_ip,
+  # 否则 fw3 会把它生成成 wan->lan 的 forward 规则,端口仍不通。
+  uci delete "firewall.$sect.dest" >/dev/null 2>&1 || true
+  uci delete "firewall.$sect.dest_ip" >/dev/null 2>&1 || true
+  uci delete "firewall.$sect.src_ip" >/dev/null 2>&1 || true
   uci set "firewall.$sect.src=wan" || return 1
   uci set "firewall.$sect.family=any" || return 1
   uci set "firewall.$sect.proto=tcp udp" || return 1
   uci set "firewall.$sect.dest_port=$port" || return 1
   uci set "firewall.$sect.target=ACCEPT" || return 1
+  uci set "firewall.$sect.enabled=1" >/dev/null 2>&1 || true
   uci commit firewall || return 1
   fw_reload
   ok "防火墙规则已写入: $name (WAN 入站 TCP/UDP $port)"
