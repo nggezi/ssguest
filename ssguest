@@ -1,0 +1,584 @@
+#!/bin/sh
+#
+# ssguest - OpenWrt 软路由 Shadowsocks 多节点管理脚本
+#
+# 用法:
+#   sh ssguest                 进入菜单
+#   ssguest add [端口]         添加节点(端口可省略,自动分配)
+#   ssguest del [节点号]       删除节点
+#   ssguest list               查看节点
+#   ssguest host [域名/IP]     设置链接里使用的公网地址
+#
+# 环境变量:
+#   SSG_METHOD=chacha20-ietf-poly1305   默认加密方式
+#   SSG_PORT_START=8388                 自动分配端口起点
+#   SSG_PORT_END=8487                   自动分配端口终点
+#   SSG_HOST=ss.example.com             链接里使用的域名/IP
+#   SSG_FW_PREFIX=Allow-Guest           防火墙规则名前缀(后面接节点号)
+#
+set -u
+
+PREFIX=${SSG_PREFIX:-}
+STATE_DIR="$PREFIX/etc/ssguest"
+NODES_DIR="$STATE_DIR/nodes"
+HOST_FILE="$STATE_DIR/host"
+INIT_DIR="$PREFIX/etc/init.d"
+SERVICE="$INIT_DIR/ssguest"
+SELF="$PREFIX/usr/bin/ssguest"
+FW_INIT="$INIT_DIR/firewall"
+
+DEFAULT_METHOD=${SSG_METHOD:-chacha20-ietf-poly1305}
+PORT_START=${SSG_PORT_START:-8388}
+PORT_END=${SSG_PORT_END:-8487}
+FW_PREFIX=${SSG_FW_PREFIX:-Allow-Guest}
+SS_BIN=""
+HOST_CACHE=""
+
+msg()  { printf '%s\n' "$*"; }
+ok()   { printf '[ OK ] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*"; }
+err()  { printf '[FAIL] %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+need_root() {
+  [ "$(id -u 2>/dev/null)" = "0" ] || die "请用 root 运行(OpenWrt 默认就是 root)"
+}
+
+is_openwrt() {
+  [ -f "$PREFIX/etc/openwrt_release" ] || [ -f "$PREFIX/etc/rc.common" ]
+}
+
+ensure_dirs() {
+  mkdir -p "$NODES_DIR" || die "无法创建 $NODES_DIR"
+  chmod 700 "$STATE_DIR" "$NODES_DIR" 2>/dev/null || true
+}
+
+ensure_ss() {
+  if ! command -v ss-server >/dev/null 2>&1; then
+    if command -v opkg >/dev/null 2>&1; then
+      msg "首次运行,正在安装 shadowsocks-libev ..."
+      opkg update >/dev/null 2>&1 || true
+      opkg install shadowsocks-libev-ss-server >/dev/null 2>&1 ||
+        opkg install shadowsocks-libev >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+      msg "首次运行,正在安装 shadowsocks-libev ..."
+      apk update >/dev/null 2>&1 || true
+      apk add shadowsocks-libev-ss-server >/dev/null 2>&1 ||
+        apk add shadowsocks-libev >/dev/null 2>&1 || true
+    else
+      die "缺少 opkg/apk,请确认这是 OpenWrt 系统"
+    fi
+  fi
+  SS_BIN=$(command -v ss-server 2>/dev/null || true)
+  [ -n "$SS_BIN" ] || die "安装失败:找不到 ss-server,请手动执行 opkg install shadowsocks-libev-ss-server"
+  [ -x "$SS_BIN" ] || die "ss-server 不可执行: $SS_BIN"
+}
+
+self_install() {
+  [ -z "$PREFIX" ] || return 0
+  [ -f "$0" ] || return 0
+  [ "$0" = "$SELF" ] && return 0
+  if [ -f "$SELF" ] && cmp -s "$0" "$SELF" 2>/dev/null; then
+    return 0
+  fi
+  mkdir -p "${SELF%/*}" || return 0
+  cp "$0" "$SELF.new.$$" 2>/dev/null || return 0
+  chmod 755 "$SELF.new.$$" 2>/dev/null || true
+  mv "$SELF.new.$$" "$SELF" 2>/dev/null || rm -f "$SELF.new.$$" 2>/dev/null
+}
+
+write_service() {
+  mkdir -p "$INIT_DIR" || return 1
+  cat > "$SERVICE" <<EOF
+#!/bin/sh /etc/rc.common
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	local cfg id
+	for cfg in $NODES_DIR/*.json; do
+		[ -f "\$cfg" ] || continue
+		id=\${cfg##*/}
+		id=\${id%.json}
+		procd_open_instance "ssguest-\$id"
+		procd_set_param command $SS_BIN -c "\$cfg" -u
+		procd_set_param respawn 3600 5 5
+		procd_set_param file "\$cfg"
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_close_instance
+	done
+}
+EOF
+  chmod 755 "$SERVICE" || return 1
+}
+
+ensure_service() {
+  write_service || die "无法写入服务脚本 $SERVICE"
+  if command -v procd >/dev/null 2>&1; then
+    "$SERVICE" enable >/dev/null 2>&1 || true
+  fi
+}
+
+service_restart() {
+  [ -x "$SERVICE" ] || return 0
+  command -v procd >/dev/null 2>&1 || return 0
+  "$SERVICE" restart >/dev/null 2>&1 || "$SERVICE" start >/dev/null 2>&1 || {
+    warn "服务重启失败,请执行 $SERVICE status 查看"
+    return 1
+  }
+}
+
+service_state() {
+  if [ ! -x "$SERVICE" ]; then
+    printf '未安装'
+    return
+  fi
+  if ! command -v procd >/dev/null 2>&1; then
+    printf '未加载'
+    return
+  fi
+  if "$SERVICE" status >/dev/null 2>&1; then
+    printf '运行中'
+  else
+    printf '未运行'
+  fi
+}
+
+gen_password() {
+  local p=""
+  p=$(dd if=/dev/urandom bs=1 count=64 2>/dev/null | base64 2>/dev/null |
+      tr -dc 'A-Za-z0-9' | cut -c1-20)
+  if [ "${#p}" -lt 16 ]; then
+    p=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 20)
+  fi
+  [ -n "$p" ] || die "无法生成随机密码(/dev/urandom 不可用?)"
+  printf '%s\n' "$p"
+}
+
+next_id() {
+  local max=0 id f
+  for f in "$NODES_DIR"/*.meta; do
+    [ -f "$f" ] || continue
+    id=$(sed -n 's/^ID=//p' "$f" | head -n1)
+    case "$id" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$id" -gt "$max" ] && max=$id
+  done
+  printf '%s\n' $((max + 1))
+}
+
+node_count() {
+  local n=0 f
+  for f in "$NODES_DIR"/*.meta; do
+    [ -f "$f" ] && n=$((n + 1))
+  done
+  printf '%s\n' "$n"
+}
+
+meta_get() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1
+}
+
+port_listening() {
+  local p=$1
+  if command -v ss >/dev/null 2>&1 && ss -lntu >/dev/null 2>&1; then
+    ss -lntu 2>/dev/null | awk 'NR > 1 { print $5 }' | grep -qE "[:.]$p\$"
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lntu 2>/dev/null | awk 'NR > 1 { print $4 }' | grep -qE "[:.]$p\$"
+    return $?
+  fi
+  return 1
+}
+
+port_in_use() {
+  local p=$1 f used
+  for f in "$NODES_DIR"/*.meta; do
+    [ -f "$f" ] || continue
+    used=$(meta_get "$f" PORT)
+    [ "$used" = "$p" ] && return 0
+  done
+  port_listening "$p"
+}
+
+find_free_port() {
+  local p=$PORT_START
+  while [ "$p" -le "$PORT_END" ]; do
+    if ! port_in_use "$p"; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+    p=$((p + 1))
+  done
+  return 1
+}
+
+normalize_port() {
+  local p
+  p=$(printf '%s' "$1" | sed 's/^0*//')
+  [ -n "$p" ] || p=0
+  printf '%s\n' "$p"
+}
+
+write_node() {
+  local id=$1 port=$2 method=$3 pass=$4
+  (
+    umask 077
+    cat > "$NODES_DIR/$id.json" <<EOF
+{
+  "server": "0.0.0.0",
+  "server_port": $port,
+  "password": "$pass",
+  "timeout": 300,
+  "method": "$method",
+  "fast_open": false
+}
+EOF
+    {
+      printf 'ID=%s\n' "$id"
+      printf 'PORT=%s\n' "$port"
+      printf 'METHOD=%s\n' "$method"
+      printf 'PASSWORD=%s\n' "$pass"
+      printf 'CREATED=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
+    } > "$NODES_DIR/$id.meta"
+  )
+}
+
+fw_find() {
+  local name=$1
+  uci show firewall 2>/dev/null |
+    sed -n "s/^firewall\.\([^.=]*\)\.name='$name'\$/\1/p"
+}
+
+fw_reload() {
+  if [ -x "$FW_INIT" ]; then
+    "$FW_INIT" reload >/dev/null 2>&1 || "$FW_INIT" restart >/dev/null 2>&1 || true
+  elif command -v fw4 >/dev/null 2>&1; then
+    fw4 reload >/dev/null 2>&1 || true
+  elif command -v fw3 >/dev/null 2>&1; then
+    fw3 reload >/dev/null 2>&1 || true
+  fi
+}
+
+fw_add() {
+  local id=$1 port=$2 name sect
+  name="$FW_PREFIX$id"
+  command -v uci >/dev/null 2>&1 || {
+    err "找不到 uci,无法添加防火墙规则"
+    return 1
+  }
+  sect=$(fw_find "$name" | head -n1 | tr -d '\r')
+  if [ -z "$sect" ]; then
+    sect=$(uci add firewall rule 2>/dev/null | tr -d '\r')
+    [ -n "$sect" ] || {
+      err "uci add firewall rule 失败"
+      return 1
+    }
+    uci set "firewall.$sect.name=$name" || return 1
+  fi
+  uci set "firewall.$sect.src=wan" || return 1
+  uci set "firewall.$sect.family=any" || return 1
+  uci set "firewall.$sect.proto=tcp udp" || return 1
+  uci set "firewall.$sect.dest_port=$port" || return 1
+  uci set "firewall.$sect.target=ACCEPT" || return 1
+  uci commit firewall || return 1
+  fw_reload
+  ok "防火墙规则已写入: $name (WAN 入站 TCP/UDP $port)"
+}
+
+fw_del() {
+  local name=$1 sect n=0
+  command -v uci >/dev/null 2>&1 || return 0
+  while :; do
+    sect=$(fw_find "$name" | head -n1 | tr -d '\r')
+    [ -n "$sect" ] || break
+    uci delete "firewall.$sect" 2>/dev/null || break
+    n=$((n + 1))
+  done
+  if [ "$n" -gt 0 ]; then
+    uci commit firewall >/dev/null 2>&1 || true
+    fw_reload
+    ok "防火墙规则已删除: $name"
+  fi
+}
+
+b64url() {
+  if command -v base64 >/dev/null 2>&1; then
+    base64
+  else
+    openssl base64
+  fi | tr -d '\n' | tr '+/' '-_' | tr -d '='
+}
+
+get_host() {
+  local h=""
+  if [ -n "$HOST_CACHE" ]; then
+    printf '%s\n' "$HOST_CACHE"
+    return 0
+  fi
+  if [ -n "${SSG_HOST:-}" ]; then
+    HOST_CACHE="$SSG_HOST"
+    printf '%s\n' "$HOST_CACHE"
+    return 0
+  fi
+  if [ -s "$HOST_FILE" ]; then
+    HOST_CACHE=$(head -n1 "$HOST_FILE")
+    printf '%s\n' "$HOST_CACHE"
+    return 0
+  fi
+
+  if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+    h=$(ubus call network.interface.wan status 2>/dev/null |
+        jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+  fi
+  if [ -z "$h" ] && command -v curl >/dev/null 2>&1; then
+    h=$(curl -4fsS --max-time 4 https://api.ipify.org 2>/dev/null)
+  fi
+  if [ -z "$h" ] && command -v wget >/dev/null 2>&1; then
+    h=$(wget -q -T 4 -O - https://api.ipify.org 2>/dev/null)
+  fi
+  case "$h" in
+    ''|*[!0-9a-fA-F:.]*) h="<路由器公网IP>" ;;
+  esac
+  HOST_CACHE="$h"
+  printf '%s\n' "$HOST_CACHE"
+}
+
+node_uri() {
+  local id=$1 port=$2 method=$3 pass=$4 host=$5 user
+  [ -n "$host" ] || host=$(get_host)
+  case "$host" in
+    \[*\]) ;;
+    *:*) host="[$host]" ;;
+  esac
+  user=$(printf '%s:%s' "$method" "$pass" | b64url)
+  printf 'ss://%s@%s:%s#SS-%s\n' "$user" "$host" "$port" "$id"
+}
+
+show_node() {
+  local id=$1 meta="$NODES_DIR/$1.meta" port method pass created rule host uri
+  port=$(meta_get "$meta" PORT)
+  method=$(meta_get "$meta" METHOD)
+  pass=$(meta_get "$meta" PASSWORD)
+  created=$(meta_get "$meta" CREATED)
+  rule="$FW_PREFIX$id"
+  if command -v uci >/dev/null 2>&1 && [ -n "$(fw_find "$rule" | head -n1)" ]; then
+    rule="$rule (已放行)"
+  else
+    rule="$rule (未找到)"
+  fi
+  host=$(get_host)
+  uri=$(node_uri "$id" "$port" "$method" "$pass" "$host")
+  msg "----- 节点 #$id -----"
+  msg "  端口:   $port"
+  msg "  密码:   $pass"
+  msg "  加密:   $method"
+  msg "  防火墙: $rule"
+  msg "  创建:   $created"
+  msg "  链接:   $uri"
+}
+
+cmd_add() {
+  local port="${1:-}" id method pass name
+  if [ -z "$port" ]; then
+    printf '端口(直接回车自动分配 %s-%s): ' "$PORT_START" "$PORT_END"
+    IFS= read -r port || port=""
+  fi
+  if [ -n "$port" ]; then
+    case "$port" in
+      *[!0-9]*) die "端口必须是数字" ;;
+    esac
+    port=$(normalize_port "$port")
+    { [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; } 2>/dev/null || die "端口范围是 1-65535"
+    port_in_use "$port" && die "端口 $port 已被占用"
+  else
+    port=$(find_free_port) || die "端口段 $PORT_START-$PORT_END 已用完,可设置 SSG_PORT_START/SSG_PORT_END"
+  fi
+
+  method="$DEFAULT_METHOD"
+  case "$method" in
+    ''|*[!A-Za-z0-9._-]*) die "加密方式无效: $method" ;;
+  esac
+
+  id=$(next_id)
+  pass=$(gen_password)
+  name="$FW_PREFIX$id"
+
+  write_node "$id" "$port" "$method" "$pass" || die "写入节点配置失败"
+  if ! fw_add "$id" "$port"; then
+    rm -f "$NODES_DIR/$id.json" "$NODES_DIR/$id.meta"
+    fw_del "$name" >/dev/null 2>&1 || true
+    die "节点未创建:防火墙规则写入失败"
+  fi
+  service_restart || true
+
+  msg ""
+  ok "节点 #$id 已创建"
+  show_node "$id"
+  if command -v qrencode >/dev/null 2>&1; then
+    msg ""
+    msg "扫码导入:"
+    qrencode -t ANSIUTF8 "$(node_uri "$id" "$port" "$method" "$pass" "$(get_host)")" 2>/dev/null || true
+  else
+    msg ""
+    msg "提示: opkg install qrencode 后再次查看节点可显示二维码"
+  fi
+}
+
+cmd_list() {
+  local n id f port
+  n=$(node_count)
+  if [ "$n" -eq 0 ]; then
+    msg "还没有节点,选择 1 添加。"
+    return 0
+  fi
+  msg "共 $n 个节点:"
+  for f in "$NODES_DIR"/*.meta; do
+    [ -f "$f" ] || continue
+    id=$(meta_get "$f" ID)
+    case "$id" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    show_node "$id"
+    port=$(meta_get "$f" PORT)
+    if port_listening "$port"; then
+      msg "  状态:   运行中"
+    elif command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
+      msg "  状态:   未监听(可执行 $SERVICE restart)"
+    fi
+    msg ""
+  done
+}
+
+cmd_del() {
+  local id="${1:-}" answer meta
+  local n
+  n=$(node_count)
+  if [ "$n" -eq 0 ]; then
+    msg "还没有节点可删除。"
+    return 0
+  fi
+  if [ -z "$id" ]; then
+    printf '现有节点:'
+    for meta in "$NODES_DIR"/*.meta; do
+      [ -f "$meta" ] || continue
+      id=$(meta_get "$meta" ID)
+      case "$id" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      printf ' #%s' "$id"
+    done
+    printf '\n'
+    id=""
+    printf '要删除的节点号: '
+    IFS= read -r id || id=""
+  fi
+  case "$id" in
+    ''|*[!0-9]*) die "节点号必须是数字" ;;
+  esac
+  meta="$NODES_DIR/$id.meta"
+  [ -f "$meta" ] || die "节点 #$id 不存在"
+  printf '确认删除节点 #%s ? [y/N]: ' "$id"
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) msg "已取消"; return 0 ;;
+  esac
+  fw_del "$FW_PREFIX$id"
+  rm -f "$NODES_DIR/$id.json" "$NODES_DIR/$id.meta"
+  service_restart || true
+  ok "节点 #$id 已删除"
+}
+
+cmd_host() {
+  local h="${1:-}"
+  if [ -z "$h" ]; then
+    if [ -s "$HOST_FILE" ]; then
+      msg "当前固定地址: $(cat "$HOST_FILE")"
+    fi
+    msg "当前链接地址: $(get_host)"
+    return 0
+  fi
+  case "$h" in
+    *[!A-Za-z0-9.:_-]*) die "地址只能包含字母、数字、点、冒号、下划线和短横线" ;;
+  esac
+  (
+    umask 077
+    printf '%s\n' "$h" > "$HOST_FILE"
+  )
+  ok "链接地址已固定为: $h"
+}
+
+menu() {
+  local choice n
+  while :; do
+    n=$(node_count)
+    msg ""
+    msg "=============================================="
+    msg " OpenWrt Shadowsocks 节点管理"
+    msg " 节点: $n    服务: $(service_state)"
+    msg "=============================================="
+    msg " 1) 添加节点"
+    msg " 2) 删除节点"
+    msg " 3) 查看已有节点"
+    msg " 4) 退出"
+    printf '请选择 [1-4]: '
+    IFS= read -r choice || break
+    case "$choice" in
+      1) cmd_add ;;
+      2) cmd_del ;;
+      3) cmd_list ;;
+      4|q|Q) break ;;
+      *) warn "请输入 1-4" ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+ssguest - OpenWrt Shadowsocks 节点管理
+
+用法:
+  ssguest                 进入菜单
+  ssguest add [端口]      添加节点(端口可省略)
+  ssguest del [节点号]    删除节点
+  ssguest list            查看节点
+  ssguest host [地址]     设置链接使用的域名/IP
+  ssguest help            显示帮助
+
+环境变量:
+  SSG_METHOD      默认加密方式,默认 chacha20-ietf-poly1305
+  SSG_PORT_START  自动分配端口起点,默认 8388
+  SSG_PORT_END    自动分配端口终点,默认 8487
+  SSG_FW_PREFIX   防火墙规则前缀,默认 Allow-Guest
+  SSG_HOST        链接使用的域名/IP
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help|help) usage; exit 0 ;;
+  esac
+
+  need_root
+  is_openwrt || die "未检测到 OpenWrt(/etc/openwrt_release 或 /etc/rc.common 不存在)"
+  ensure_dirs
+  ensure_ss
+  ensure_service
+  self_install
+
+  case "${1:-}" in
+    add) shift; cmd_add "${1:-}" ;;
+    del|delete|remove) shift; cmd_del "${1:-}" ;;
+    list|ls) cmd_list ;;
+    host) shift; cmd_host "${1:-}" ;;
+    menu|'') menu ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
