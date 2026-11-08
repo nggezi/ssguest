@@ -37,6 +37,8 @@ curl -fsSL -o /tmp/ssguest https://ghfast.top/https://raw.githubusercontent.com/
 
 删除节点会停止对应进程、删除节点配置，并把同名防火墙规则一起删除。
 
+关于防火墙：Allow-GuestN 是允许 WAN 入站到路由器本机的 input 规则，源区域选 wan，目标区域留空（或选“设备/输入”）。不要把它改成“WAN → LAN + 目标 IP 192.168.1.1”，那会生成 forward 规则，SS 服务在路由器本机上时不会生效。脚本在更新规则时会自动清掉 dest 和 dest_ip，防止这类误改。
+
 ## 加密方式
 
 默认使用 chacha20-ietf-poly1305。它是 AEAD 加密，主流 SS 客户端都支持；在没有 AES 硬件加速的 ARM/MIPS 软路由上通常比 AES-GCM 更稳。x86 软路由也可以换成 aes-256-gcm：
