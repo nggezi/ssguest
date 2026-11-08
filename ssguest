@@ -22,6 +22,7 @@ PREFIX=${SSG_PREFIX:-}
 STATE_DIR="$PREFIX/etc/ssguest"
 NODES_DIR="$STATE_DIR/nodes"
 HOST_FILE="$STATE_DIR/host"
+LIBSODIUM_BACKUP="$STATE_DIR/libsodium"
 INIT_DIR="$PREFIX/etc/init.d"
 SERVICE="$INIT_DIR/ssguest"
 SELF="$PREFIX/usr/bin/ssguest"
@@ -53,6 +54,29 @@ ensure_dirs() {
   chmod 700 "$STATE_DIR" "$NODES_DIR" 2>/dev/null || true
 }
 
+backup_libsodium() {
+  local f base
+  mkdir -p "$LIBSODIUM_BACKUP" 2>/dev/null || return 0
+  for f in "$PREFIX"/usr/lib/libsodium.so.* "$PREFIX"/rom/usr/lib/libsodium.so.*; do
+    [ -e "$f" ] || continue
+    base=${f##*/}
+    [ -e "$LIBSODIUM_BACKUP/$base" ] && continue
+    cp -a "$f" "$LIBSODIUM_BACKUP/$base" 2>/dev/null || true
+  done
+}
+
+restore_libsodium() {
+  local f base
+  for f in "$LIBSODIUM_BACKUP"/libsodium.so.* "$PREFIX"/rom/usr/lib/libsodium.so.*; do
+    [ -e "$f" ] || continue
+    base=${f##*/}
+    if [ -e "$PREFIX/usr/lib/$base" ] || [ -L "$PREFIX/usr/lib/$base" ]; then
+      continue
+    fi
+    cp -a "$f" "$PREFIX/usr/lib/$base" 2>/dev/null || true
+  done
+}
+
 ensure_ss() {
   if ! command -v ss-server >/dev/null 2>&1; then
     if command -v opkg >/dev/null 2>&1; then
@@ -72,16 +96,20 @@ ensure_ss() {
   SS_BIN=$(command -v ss-server 2>/dev/null || true)
   [ -n "$SS_BIN" ] || die "安装失败:找不到 ss-server,请手动执行 opkg install shadowsocks-libev-ss-server"
   [ -x "$SS_BIN" ] || die "ss-server 不可执行: $SS_BIN"
+  restore_libsodium
   if ! "$SS_BIN" -h 2>&1 | grep -q 'shadowsocks-libev'; then
     warn "ss-server 运行检查失败,尝试修复依赖 ..."
+    backup_libsodium
     if command -v opkg >/dev/null 2>&1; then
       opkg update >/dev/null 2>&1 || true
       opkg install libsodium >/dev/null 2>&1 || true
+      restore_libsodium
       "$SS_BIN" -h 2>&1 | grep -q 'shadowsocks-libev' ||
         opkg install --force-reinstall shadowsocks-libev-ss-server >/dev/null 2>&1 || true
     elif command -v apk >/dev/null 2>&1; then
       apk update >/dev/null 2>&1 || true
       apk add libsodium >/dev/null 2>&1 || true
+      restore_libsodium
     fi
     if ! "$SS_BIN" -h 2>&1 | grep -q 'shadowsocks-libev'; then
       err "ss-server 依赖不完整,错误如下:"
