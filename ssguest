@@ -409,10 +409,13 @@ cmd_add() {
   esac
 
   id=$(next_id)
-  pass=$(gen_password)
+  pass=$(gen_password) || die "生成随机密码失败"
+  [ -n "$pass" ] || die "生成随机密码失败"
   name="$FW_PREFIX$id"
 
   write_node "$id" "$port" "$method" "$pass" || die "写入节点配置失败"
+  [ -s "$NODES_DIR/$id.json" ] && [ -s "$NODES_DIR/$id.meta" ] ||
+    die "写入节点配置失败"
   if ! fw_add "$id" "$port"; then
     rm -f "$NODES_DIR/$id.json" "$NODES_DIR/$id.meta"
     fw_del "$name" >/dev/null 2>&1 || true
