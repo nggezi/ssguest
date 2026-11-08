@@ -372,7 +372,11 @@ show_node() {
     rule="$rule (未找到)"
   fi
   host=$(get_host)
-  uri=$(node_uri "$id" "$port" "$method" "$pass" "$host")
+  if [ "$host" = "<路由器公网IP>" ]; then
+    uri="未探测到公网 IP,请先执行: ssguest host 你的域名或IP"
+  else
+    uri=$(node_uri "$id" "$port" "$method" "$pass" "$host")
+  fi
   msg "----- 节点 #$id -----"
   msg "  端口:   $port"
   msg "  密码:   $pass"
@@ -383,7 +387,7 @@ show_node() {
 }
 
 cmd_add() {
-  local port="${1:-}" id method pass name
+  local port="${1:-}" id method pass name host
   if [ -z "$port" ]; then
     printf '端口(直接回车自动分配 %s-%s): ' "$PORT_START" "$PORT_END"
     IFS= read -r port || port=""
@@ -419,10 +423,11 @@ cmd_add() {
   msg ""
   ok "节点 #$id 已创建"
   show_node "$id"
-  if command -v qrencode >/dev/null 2>&1; then
+  host=$(get_host)
+  if [ "$host" != "<路由器公网IP>" ] && command -v qrencode >/dev/null 2>&1; then
     msg ""
     msg "扫码导入:"
-    qrencode -t ANSIUTF8 "$(node_uri "$id" "$port" "$method" "$pass" "$(get_host)")" 2>/dev/null || true
+    qrencode -t ANSIUTF8 "$(node_uri "$id" "$port" "$method" "$pass" "$host")" 2>/dev/null || true
   else
     msg ""
     msg "提示: opkg install qrencode 后再次查看节点可显示二维码"
