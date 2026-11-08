@@ -72,6 +72,25 @@ ensure_ss() {
   SS_BIN=$(command -v ss-server 2>/dev/null || true)
   [ -n "$SS_BIN" ] || die "安装失败:找不到 ss-server,请手动执行 opkg install shadowsocks-libev-ss-server"
   [ -x "$SS_BIN" ] || die "ss-server 不可执行: $SS_BIN"
+  if ! "$SS_BIN" -h 2>&1 | grep -q 'shadowsocks-libev'; then
+    warn "ss-server 运行检查失败,尝试修复依赖 ..."
+    if command -v opkg >/dev/null 2>&1; then
+      opkg update >/dev/null 2>&1 || true
+      opkg install libsodium >/dev/null 2>&1 || true
+      "$SS_BIN" -h 2>&1 | grep -q 'shadowsocks-libev' ||
+        opkg install --force-reinstall shadowsocks-libev-ss-server >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+      apk update >/dev/null 2>&1 || true
+      apk add libsodium >/dev/null 2>&1 || true
+    fi
+    if ! "$SS_BIN" -h 2>&1 | grep -q 'shadowsocks-libev'; then
+      err "ss-server 依赖不完整,错误如下:"
+      "$SS_BIN" -h 2>&1 | head -n 5 >&2
+      die "请先执行 opkg update && opkg install libsodium,或检查软件源版本"
+    fi
+    ok "ss-server 依赖已修复"
+    service_restart >/dev/null 2>&1 || true
+  fi
 }
 
 self_install() {
