@@ -78,6 +78,21 @@ ssguest host ss.example.com   # 固定链接里的域名/IP
 logread | grep ss-server
 ~~~
 
+如果菜单显示“服务: 运行中”但节点状态是“未监听”，先执行：
+
+~~~sh
+ss-server -h
+~~~
+
+能正常输出版本号才说明程序可以启动。若提示缺少 `libsodium.so.27` 之类的共享库，执行：
+
+~~~sh
+opkg update && opkg install libsodium
+/etc/init.d/ssguest restart
+~~~
+
+新版脚本已经会在启动前做这个检查，并在缺依赖时自动尝试修复。
+
 ## 卸载
 
 ~~~sh
